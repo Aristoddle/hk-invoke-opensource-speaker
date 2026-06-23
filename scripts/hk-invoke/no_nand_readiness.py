@@ -163,6 +163,80 @@ def builder_check(skip: bool) -> dict[str, Any]:
     }
 
 
+def operator_next_step_schema() -> dict[str, Any]:
+    return {
+        "decisions": [
+            "arm_ram_listener_allowed",
+            "normal_baseline_visible",
+            "hold_no_custom_boot",
+        ],
+        "persistent_storage_changes_allowed": False,
+        "sends_usb_payloads": False,
+        "opens_serial": False,
+        "runs_adb": False,
+    }
+
+
+def operator_next_step(decision: str) -> dict[str, Any]:
+    steps = {
+        "arm_ram_listener_allowed": {
+            "kind": "arm_mac_listener_before_touching_device",
+            "physical_action_needed_now": False,
+            "operator_phrase": "WAIT: Mac-side RAM listener/check-only gate must be armed before any service-mode touch",
+            "allowed_physical_actions": [
+                "Keep power and USB stable while the Mac-side listener is prepared",
+                "Only enter service/yellow mode after an explicit NOW: service-mode sequence needed prompt",
+            ],
+            "forbidden_physical_actions": [
+                "Do not unplug/replug or 4-click Mic-Off while no listener is armed",
+                "Do not run persistent NAND/eMMC/SPI/env-affecting commands",
+            ],
+        },
+        "normal_baseline_visible": {
+            "kind": "preserve_normal_bluetooth_baseline",
+            "physical_action_needed_now": False,
+            "operator_phrase": "OK: normal Bluetooth/audio baseline visible; do not enter service mode",
+            "allowed_physical_actions": [
+                "Leave the Invoke powered normally",
+                "Use Bluetooth audio normally or keep USB attached for host observation",
+            ],
+            "forbidden_physical_actions": [
+                "Do not hold reset",
+                "Do not 4-click Mic-Off into service/yellow mode unless Joe explicitly approves a RAM-only session",
+            ],
+        },
+        "hold_no_custom_boot": {
+            "kind": "restore_one_visible_surface",
+            "physical_action_needed_now": True,
+            "operator_phrase": "NOW: normal-mode surface restore only; no service/orange/yellow mode",
+            "allowed_physical_actions": [
+                "Power the Invoke normally",
+                "Do not hold reset",
+                "Do not 4-click Mic-Off",
+                "Try Bluetooth re-pair or reconnect as HK Invoke audio",
+                "Keep USB connected to the Mac/dock if convenient while surface-watch runs",
+            ],
+            "forbidden_physical_actions": [
+                "Do not start a RAM listener",
+                "Do not enter service/yellow/orange mode",
+                "Do not send USB boot payloads",
+                "Do not run ADB or open serial",
+                "Do not run NAND/eMMC/SPI/env write commands",
+            ],
+        },
+    }
+    return steps.get(
+        decision,
+        {
+            "kind": "inspect_unrecognized_decision",
+            "physical_action_needed_now": False,
+            "operator_phrase": f"WAIT: inspect unrecognized readiness decision {decision!r}",
+            "allowed_physical_actions": ["Preserve current state"],
+            "forbidden_physical_actions": ["Do not enter service mode until the decision is understood"],
+        },
+    )
+
+
 def decide(facts: dict[str, bool]) -> tuple[str, bool, str, list[str]]:
     if facts["marvell_service_loader_visible"]:
         return (
@@ -214,6 +288,7 @@ def readiness_report(
         "custom_ram_boot_next": custom_next,
         "reason": reason,
         "recommended_commands": commands,
+        "operator_next_step": operator_next_step(decision),
         "builder_check": builder_check(skip_builder_check),
         "latest_artifact": artifact_summary(artifact),
         "sends_usb_payloads": False,
@@ -221,6 +296,7 @@ def readiness_report(
         "runs_adb": False,
         "writes_device_storage": False,
         "persistent_storage_changes_allowed": False,
+        "operator_next_step_schema": operator_next_step_schema(),
     }
 
 
@@ -240,6 +316,19 @@ def human_report(report: dict[str, Any]) -> str:
         "Recommended commands:",
     ]
     lines.extend(f"  {cmd}" for cmd in report["recommended_commands"])
+    operator = report.get("operator_next_step", {})
+    lines.extend(
+        [
+            "",
+            "Operator next step:",
+            f"  {operator.get('operator_phrase', 'not recorded')}",
+            "",
+            "Allowed physical actions:",
+        ]
+    )
+    lines.extend(f"  - {action}" for action in operator.get("allowed_physical_actions", []))
+    lines.extend(["", "Forbidden physical actions:"])
+    lines.extend(f"  - {action}" for action in operator.get("forbidden_physical_actions", []))
     lines.extend(
         [
             "",
@@ -274,6 +363,7 @@ def main() -> int:
                     "runs_adb": False,
                     "writes_device_storage": False,
                     "persistent_storage_changes_allowed": False,
+                    "operator_next_step_schema": operator_next_step_schema(),
                 },
                 indent=2,
                 sort_keys=True,

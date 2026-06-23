@@ -31,6 +31,20 @@ WIFI_PROFILES = {
         "HK_INVOKE_RAM_WIFI_YOURSSID_PSK",
     ],
 }
+HOST_AUDIO_GATES = {
+    "strict_invoke_bluetooth_output": {
+        "description": "Mac input plus HK Invoke Bluetooth output; proves host responses can play through the speaker.",
+        "command": "python3 scripts/host/list_audio_devices.py --require-input MacBook --require-output 'HK Invoke'",
+        "requires_invoke_visible": True,
+        "touches_invoke": False,
+    },
+    "mac_input_fallback": {
+        "description": "Mac input only; proves host assistant loop can proceed without claiming Invoke speaker playback.",
+        "command": "python3 scripts/host/list_audio_devices.py --require-input MacBook",
+        "requires_invoke_visible": False,
+        "touches_invoke": False,
+    },
+}
 ESCALATION_GATES = [
     {
         "id": "serial_read_only_inventory",
@@ -200,6 +214,9 @@ def check_summary() -> dict[str, Any]:
         "builds_artifacts_offline_only": True,
         "writes_host_session_artifacts": True,
         "escalation_packet_defined": True,
+        "includes_golden_nand_preflight": True,
+        "host_audio_gates_defined": True,
+        "host_audio_gates": HOST_AUDIO_GATES,
         "escalation_gates": ESCALATION_GATES,
     }
 
@@ -299,6 +316,33 @@ def run_plan(session_dir: Path) -> dict[str, Any]:
     }
 
 
+def run_golden_nand_preflight_plan(session_dir: Path, skip: bool) -> dict[str, Any]:
+    if skip:
+        return {"skipped": True}
+    out_root = session_dir / "golden-nand-preflight"
+    result = run_cmd(
+        [
+            "python3",
+            "scripts/hk-invoke/golden_nand_dump_plan.py",
+            "--out-root",
+            str(out_root),
+        ],
+        timeout=30,
+    )
+    write_json(session_dir / "commands/golden-nand-preflight-command.json", result)
+    artifact_dir = result["output"].strip().splitlines()[-1] if result["output"].strip() else ""
+    artifact = Path(artifact_dir) if artifact_dir else None
+    return {
+        "skipped": False,
+        "exit_code": result["exit_code"],
+        "artifact_dir": artifact_dir,
+        "artifact_dir_exists": bool(artifact and artifact.exists()),
+        "manifest": str(artifact / "MANIFEST.json") if artifact else None,
+        "plan": str(artifact / "PLAN.md") if artifact else None,
+        "device_preflight_script": str(artifact / "device-preflight-readonly.sh") if artifact else None,
+    }
+
+
 def run_artifact_build(session_dir: Path, skip: bool) -> dict[str, Any]:
     if skip:
         return {"skipped": True}
@@ -341,8 +385,19 @@ def run_artifact_build(session_dir: Path, skip: bool) -> dict[str, Any]:
 
 def run_host_fallback(session_dir: Path, skip: bool) -> dict[str, Any]:
     if skip:
-        return {"skipped": True}
-    audio = run_cmd(
+        return {"skipped": True, "gates": HOST_AUDIO_GATES}
+    strict = run_cmd(
+        [
+            "python3",
+            "scripts/host/list_audio_devices.py",
+            "--require-input",
+            "MacBook",
+            "--require-output",
+            "HK Invoke",
+        ],
+        timeout=30,
+    )
+    fallback = run_cmd(
         ["python3", "scripts/host/list_audio_devices.py", "--require-input", "MacBook"],
         timeout=30,
     )
@@ -355,16 +410,25 @@ def run_host_fallback(session_dir: Path, skip: bool) -> dict[str, Any]:
         ],
         timeout=30,
     )
-    write_text(session_dir / "host-audio-fallback.txt", audio["output"])
-    write_text(session_dir / "host-realtime-dry-run.txt", realtime["output"])
-    write_json(session_dir / "commands/host-audio-fallback-command.json", audio)
+    strict_path = session_dir / "host-audio-strict-invoke-output.txt"
+    fallback_path = session_dir / "host-audio-fallback.txt"
+    realtime_path = session_dir / "host-realtime-dry-run.txt"
+    write_text(strict_path, strict["output"])
+    write_text(fallback_path, fallback["output"])
+    write_text(realtime_path, realtime["output"])
+    write_json(session_dir / "commands/host-audio-strict-invoke-output-command.json", strict)
+    write_json(session_dir / "commands/host-audio-fallback-command.json", fallback)
     write_json(session_dir / "commands/host-realtime-dry-run-command.json", realtime)
     return {
         "skipped": False,
-        "audio_exit_code": audio["exit_code"],
+        "gates": HOST_AUDIO_GATES,
+        "strict_invoke_output_exit_code": strict["exit_code"],
+        "mac_input_fallback_exit_code": fallback["exit_code"],
+        "audio_exit_code": fallback["exit_code"],
         "realtime_dry_run_exit_code": realtime["exit_code"],
-        "audio_output": str(session_dir / "host-audio-fallback.txt"),
-        "realtime_output": str(session_dir / "host-realtime-dry-run.txt"),
+        "strict_invoke_output": str(strict_path),
+        "audio_output": str(fallback_path),
+        "realtime_output": str(realtime_path),
     }
 
 
@@ -442,6 +506,20 @@ def markdown_summary(summary: dict[str, Any]) -> str:
         lines.append("Recommended commands:")
         lines.extend(f"- `{cmd}`" for cmd in recommended)
         lines.append("")
+    operator = summary.get("operator_next_step", {})
+    lines.extend(
+        [
+            "## Operator next step",
+            "",
+            operator.get("operator_phrase") or "not recorded",
+            "",
+            "Allowed physical actions:",
+        ]
+    )
+    lines.extend(f"- {action}" for action in operator.get("allowed_physical_actions", []))
+    lines.extend(["", "Forbidden physical actions:"])
+    lines.extend(f"- {action}" for action in operator.get("forbidden_physical_actions", []))
+    lines.append("")
     surface = summary.get("surface_watch", {})
     lines.extend(
         [
@@ -455,6 +533,7 @@ def markdown_summary(summary: dict[str, Any]) -> str:
         ]
     )
     artifacts = summary.get("artifacts", {})
+    golden = artifacts.get("golden_nand_preflight") or {}
     lines.extend(
         [
             "## Offline artifacts",
@@ -462,6 +541,13 @@ def markdown_summary(summary: dict[str, Any]) -> str:
             f"- Plan directory: `{artifacts.get('plan_dir') or 'not generated'}`",
             f"- OTA83 staged artifact: `{artifacts.get('ota83_artifact_dir') or 'not generated'}`",
             f"- RAM check-only exit: `{artifacts.get('ram_check_only_exit_code')}`",
+            f"- Golden NAND preflight plan: `{golden.get('artifact_dir') or 'not generated'}`",
+            f"- Golden NAND preflight device script: `{golden.get('device_preflight_script') or 'not generated'}`",
+            f"- Golden NAND preflight exit: `{golden.get('exit_code')}`",
+            "",
+            "The golden NAND preflight artifact is not a dump executor and is not a reason to ask",
+            "Joe for service mode by itself; it only makes the later operator-present read-only",
+            "capability check precise.",
             "",
             "## Host assistant fallback",
             "",
@@ -473,8 +559,13 @@ def markdown_summary(summary: dict[str, Any]) -> str:
     else:
         lines.extend(
             [
-                f"- host assistant fallback audio gate exit: `{fallback.get('audio_exit_code')}`",
+                f"- strict Invoke Bluetooth output gate exit: `{fallback.get('strict_invoke_output_exit_code')}`",
+                f"- Mac-input-only fallback gate exit: `{fallback.get('mac_input_fallback_exit_code')}`",
                 f"- host assistant fallback realtime dry-run exit: `{fallback.get('realtime_dry_run_exit_code')}`",
+                "",
+                "Strict gate success means the host can route responses to the Invoke Bluetooth speaker.",
+                "Fallback gate success only means a host-side assistant loop can proceed without claiming",
+                "Invoke speaker playback.",
             ]
         )
     lines.extend(
@@ -502,6 +593,7 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
     readiness = run_readiness(state_path, session_dir)
     surface_watch = run_surface_watch(state_path, session_dir)
     plan = run_plan(session_dir)
+    golden_preflight = run_golden_nand_preflight_plan(session_dir, args.skip_golden_preflight)
     artifact = run_artifact_build(session_dir, args.skip_artifact_build)
     host_fallback = run_host_fallback(session_dir, args.skip_host_fallback)
 
@@ -516,7 +608,9 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
         "marvell_service_loader_visible": readiness.get("marvell_service_loader_visible"),
         "reason": readiness.get("reason"),
         "recommended_commands": readiness.get("recommended_commands") or [],
+        "operator_next_step": readiness.get("operator_next_step"),
         "wifi_profiles": WIFI_PROFILES,
+        "host_audio_gates": HOST_AUDIO_GATES,
         "escalation_gates": ESCALATION_GATES,
         "surface_watch": {
             "decision": surface_watch.get("decision"),
@@ -537,6 +631,7 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": {
             "plan_dir": plan.get("plan_dir"),
             "plan_dir_exists": plan.get("plan_dir_exists"),
+            "golden_nand_preflight": golden_preflight,
             "ota83_artifact_dir": artifact.get("artifact_dir"),
             "ota83_artifact_dir_exists": artifact.get("artifact_dir_exists"),
             "ram_check_only_exit_code": artifact.get("ram_check_only_exit_code"),
@@ -545,6 +640,7 @@ def build_summary(args: argparse.Namespace) -> dict[str, Any]:
         "host_fallback": host_fallback,
         "command_results": {
             "plan_exit_code": plan.get("exit_code"),
+            "golden_nand_preflight_exit_code": golden_preflight.get("exit_code"),
             "artifact_build_exit_code": artifact.get("exit_code"),
         },
     }
@@ -559,6 +655,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="print summary JSON instead of the session path")
     parser.add_argument("--state-file", type=Path, help="parse saved hk_invoke_state.sh output instead of probing")
     parser.add_argument("--session-dir", type=Path, help="where to write the packet")
+    parser.add_argument("--skip-golden-preflight", action="store_true", help="skip golden NAND preflight plan generation")
     parser.add_argument("--skip-artifact-build", action="store_true", help="skip OTA83 no-NAND artifact generation")
     parser.add_argument("--skip-host-fallback", action="store_true", help="skip host-audio-fallback and realtime dry-run checks")
     args = parser.parse_args()

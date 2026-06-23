@@ -102,6 +102,20 @@ def markdown_summary(summary: dict[str, Any]) -> str:
         "Recommended commands:",
     ]
     lines.extend(f"- `{cmd}`" for cmd in summary.get("recommended_commands", []))
+    operator = summary.get("operator_next_step", {})
+    lines.extend(
+        [
+            "",
+            "## Operator next step",
+            "",
+            operator.get("operator_phrase") or "not recorded",
+            "",
+            "Allowed physical actions:",
+        ]
+    )
+    lines.extend(f"- {action}" for action in operator.get("allowed_physical_actions", []))
+    lines.extend(["", "Forbidden physical actions:"])
+    lines.extend(f"- {action}" for action in operator.get("forbidden_physical_actions", []))
     lines.extend(
         [
             "",
@@ -198,6 +212,7 @@ def summarize(samples: list[dict[str, Any]], session_dir: Path) -> dict[str, Any
         "custom_ram_boot_next": custom_next,
         "reason": reason,
         "recommended_commands": commands,
+        "operator_next_step": no_nand_readiness.operator_next_step(decision),
         "samples": sample_records,
         "summary_json": str(session_dir / "summary.json"),
         "summary_md": str(session_dir / "summary.md"),

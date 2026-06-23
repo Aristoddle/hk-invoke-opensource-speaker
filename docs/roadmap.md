@@ -101,7 +101,7 @@ ps w
 netstat -lntup || ss -lntup
 ```
 
-**Rollback gate:** before persistence, dump MTD partitions and verify sizes/hashes against `/proc/mtd`.
+**Rollback gate:** before persistence, run the source-owned `make golden-nand-dump-plan` preflight, then at a separate operator-present gate dump MTD partitions with a proven read-only `nanddump --oob` transfer path and verify sizes/hashes against `/proc/mtd`.
 
 ### M4 — ALSA audio proof
 

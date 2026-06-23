@@ -22,12 +22,18 @@ assert 'run_bounded "$boot_bin" detect' in state, state
 assert 'run_bounded arp -a' in state, state
 assert "surface-watch:" in makefile, makefile
 assert "scripts/hk-invoke/surface_watch.py" in makefile, makefile
+assert "golden-nand-dump-plan:" in makefile, makefile
+assert "scripts/hk-invoke/golden_nand_dump_plan.py" in makefile, makefile
 print("state probe bounded-command validation passed")
 PY
 scripts/hk-invoke/normal_boot_probe.sh --check >$validate_tmp/hk-invoke-normal-boot-probe-check.out
 rg -q '^adb_devices_probe=false$' $validate_tmp/hk-invoke-normal-boot-probe-check.out
 scripts/hk-invoke/normal_boot_probe.sh --check --adb-devices >$validate_tmp/hk-invoke-normal-boot-probe-adb-check.out
 rg -q '^adb_devices_probe=true$' $validate_tmp/hk-invoke-normal-boot-probe-adb-check.out
+python3 scripts/hk-invoke/wifi_ip_probe.py --check >$validate_tmp/hk-invoke-wifi-ip-probe-check.out
+rg -q '"classification": "active-network-reachability-probe"' $validate_tmp/hk-invoke-wifi-ip-probe-check.out
+rg -q '"runs_adb": false' $validate_tmp/hk-invoke-wifi-ip-probe-check.out
+rg -q '"writes_device_storage": false' $validate_tmp/hk-invoke-wifi-ip-probe-check.out
 if HK_INVOKE_MDNS_SECONDS=not-a-number scripts/hk-invoke/normal_boot_probe.sh --check >$validate_tmp/hk-invoke-normal-boot-probe-bad-mdns.out 2>&1; then
   print -u2 'ERROR: normal_boot_probe.sh allowed a malformed HK_INVOKE_MDNS_SECONDS value'
   exit 1
@@ -107,6 +113,8 @@ scripts/hk-invoke/no_nand_post_boot_probe.py --check >$validate_tmp/hk-invoke-no
 scripts/hk-invoke/surface_watch.py --check >$validate_tmp/hk-invoke-surface-watch-check.out
 scripts/hk-invoke/no_nand_readiness.py --check >$validate_tmp/hk-invoke-no-nand-readiness-check.out
 scripts/hk-invoke/native_connectivity_packet.py --check >$validate_tmp/hk-invoke-native-connectivity-packet-check.out
+scripts/hk-invoke/golden_nand_dump_plan.py --check >$validate_tmp/hk-invoke-golden-nand-dump-plan-check.out
+rg -q 'golden NAND dump preflight plan validation passed' $validate_tmp/hk-invoke-golden-nand-dump-plan-check.out
 python3 - $validate_tmp/hk-invoke-no-nand-readiness-check.out <<'PY'
 import json, sys
 
@@ -117,6 +125,9 @@ assert j["sends_usb_payloads"] is False, j
 assert j["opens_serial"] is False, j
 assert j["runs_adb"] is False, j
 assert j["writes_device_storage"] is False, j
+schema = j["operator_next_step_schema"]
+assert "hold_no_custom_boot" in schema["decisions"], schema
+assert schema["persistent_storage_changes_allowed"] is False, schema
 print("no-NAND readiness check classification validation passed")
 PY
 python3 - $validate_tmp/hk-invoke-native-connectivity-packet-check.out <<'PY'
@@ -132,6 +143,13 @@ assert j["writes_device_storage"] is False, j
 assert j["persistent_storage_changes_allowed"] is False, j
 assert j["builds_artifacts_offline_only"] is True, j
 assert j["escalation_packet_defined"] is True, j
+assert j["includes_golden_nand_preflight"] is True, j
+assert j["host_audio_gates_defined"] is True, j
+host_audio_gates = j["host_audio_gates"]
+assert host_audio_gates["strict_invoke_bluetooth_output"]["requires_invoke_visible"] is True, j
+assert host_audio_gates["strict_invoke_bluetooth_output"]["touches_invoke"] is False, j
+assert "--require-output 'HK Invoke'" in host_audio_gates["strict_invoke_bluetooth_output"]["command"], j
+assert host_audio_gates["mac_input_fallback"]["requires_invoke_visible"] is False, j
 gates = {gate["id"]: gate for gate in j["escalation_gates"]}
 for required in (
     "serial_read_only_inventory",
@@ -257,6 +275,8 @@ assert normal["custom_ram_boot_next"] is False, normal
 assert normal["bluetooth_visible"] is True, normal
 assert normal["audio_visible"] is True, normal
 assert normal["marvell_service_loader_visible"] is False, normal
+assert normal["operator_next_step"]["kind"] == "preserve_normal_bluetooth_baseline", normal
+assert normal["operator_next_step"]["physical_action_needed_now"] is False, normal
 
 service = run("service-loader")
 assert service["decision"] == "arm_ram_listener_allowed", service
@@ -264,6 +284,8 @@ assert service["custom_ram_boot_next"] is True, service
 assert service["marvell_service_loader_visible"] is True, service
 assert "make no-nand-initramfs" in "\n".join(service["recommended_commands"]), service
 assert "ram_boot_console.sh --check-only" in "\n".join(service["recommended_commands"]), service
+assert service["operator_next_step"]["kind"] == "arm_mac_listener_before_touching_device", service
+assert service["operator_next_step"]["physical_action_needed_now"] is False, service
 
 hold = run("no-surface")
 assert hold["decision"] == "hold_no_custom_boot", hold
@@ -272,6 +294,10 @@ assert hold["bluetooth_visible"] is False, hold
 assert hold["audio_visible"] is False, hold
 assert hold["marvell_service_loader_visible"] is False, hold
 assert "make surface-watch" in "\n".join(hold["recommended_commands"]), hold
+assert hold["operator_next_step"]["kind"] == "restore_one_visible_surface", hold
+assert hold["operator_next_step"]["physical_action_needed_now"] is True, hold
+assert "no service/orange/yellow" in hold["operator_next_step"]["operator_phrase"], hold
+assert "Do not enter service/yellow/orange mode" in "\n".join(hold["operator_next_step"]["forbidden_physical_actions"]), hold
 
 for result in (normal, service, hold):
     forbidden = ("saveenv", "l2nand", "tftp2nand", "nanderase", "nand write", "nand erase")
@@ -314,9 +340,25 @@ assert summary["sends_usb_payloads"] is False, summary
 assert summary["opens_serial"] is False, summary
 assert summary["runs_adb"] is False, summary
 assert summary["writes_device_storage"] is False, summary
+operator = summary["operator_next_step"]
+assert operator["kind"] == "restore_one_visible_surface", operator
+assert operator["physical_action_needed_now"] is True, operator
+assert "no service/orange/yellow" in operator["operator_phrase"], operator
 assert summary["artifacts"]["plan_dir"], summary
+golden = summary["artifacts"]["golden_nand_preflight"]
+assert golden["exit_code"] == 0, golden
+assert golden["artifact_dir_exists"] is True, golden
+assert Path(golden["manifest"]).exists(), golden
+assert Path(golden["plan"]).exists(), golden
+assert Path(golden["device_preflight_script"]).exists(), golden
+assert "golden_nand_preflight_exit_code" in summary["command_results"], summary
 assert summary["wifi_profiles"]["named_targets"] == ["YOURSSID", "YOURSSID", "yourssid"], summary
 assert summary["wifi_profiles"]["credential_posture"] == "runtime_env_only", summary
+host_audio_gates = summary["host_audio_gates"]
+assert host_audio_gates["strict_invoke_bluetooth_output"]["requires_invoke_visible"] is True, summary
+assert host_audio_gates["mac_input_fallback"]["requires_invoke_visible"] is False, summary
+assert summary["host_fallback"]["skipped"] is True, summary
+assert "strict_invoke_bluetooth_output" in summary["host_fallback"]["gates"], summary
 assert "HK_INVOKE_RAM_WIFI_YOURSSID_PSK" in summary["wifi_profiles"]["runtime_psk_env"], summary
 gates = {gate["id"]: gate for gate in summary["escalation_gates"]}
 assert "serial_read_only_inventory" in gates, gates
@@ -336,11 +378,16 @@ assert Path(summary["files"]["readiness_json"]).exists(), summary
 assert "make surface-watch" in "\n".join(summary["recommended_commands"]), summary
 assert "Do not start a RAM listener" in markdown, markdown
 assert "make surface-watch" in markdown, markdown
+assert "Operator next step" in markdown, markdown
+assert "normal-mode surface restore only" in markdown, markdown
+assert "Do not enter service/yellow/orange mode" in markdown, markdown
 assert "YOURSSID" in markdown, markdown
 assert "YOURSSID" in markdown, markdown
 assert "yourssid" in markdown, markdown
 assert "Surface watch" in markdown, markdown
 assert "host assistant fallback" in markdown, markdown
+assert "Golden NAND preflight" in markdown, markdown
+assert "not a dump executor" in markdown, markdown
 assert "Escalation packet" in markdown, markdown
 assert "serial_read_only_inventory" in markdown, markdown
 assert "no_nand_serial_inventory.py" in markdown, markdown
@@ -412,7 +459,10 @@ assert bluetooth["surface_seen"] is True, bluetooth
 assert bluetooth["samples_count"] == 2, bluetooth
 assert bluetooth["first_surface_sample"] == 2, bluetooth
 assert bluetooth["custom_ram_boot_next"] is False, bluetooth
-assert Path(bluetooth["summary_md"]).exists(), bluetooth
+assert bluetooth["operator_next_step"]["kind"] == "preserve_normal_bluetooth_baseline", bluetooth
+bluetooth_md = Path(bluetooth["summary_md"])
+assert bluetooth_md.exists(), bluetooth
+assert "Operator next step" in bluetooth_md.read_text(), bluetooth
 for sample in bluetooth["samples"]:
     assert Path(sample["state_file"]).exists(), sample
     assert Path(sample["readiness_file"]).exists(), sample
@@ -421,6 +471,7 @@ assert marvell["surface_seen"] is True, marvell
 assert marvell["samples_count"] == 2, marvell
 assert marvell["first_surface_sample"] == 2, marvell
 assert marvell["custom_ram_boot_next"] is True, marvell
+assert marvell["operator_next_step"]["kind"] == "arm_mac_listener_before_touching_device", marvell
 for sample in marvell["samples"]:
     assert Path(sample["state_file"]).exists(), sample
     assert Path(sample["readiness_file"]).exists(), sample
@@ -612,6 +663,10 @@ fi
 if [[ -f /tmp/hk-invoke-ota2-work-current/83_IMAGE ]]; then
   scripts/hk-invoke/parse_ota83.py /tmp/hk-invoke-ota2-work-current/83_IMAGE >$validate_tmp/hk-invoke-parse-validation.out
   tmp_json=$(mktemp)
+  if [[ -f /tmp/hk-invoke-stockroot-83/83_IMAGE ]]; then
+    scripts/hk-invoke/analyze_stockroot_bootimgs.py --check /tmp/hk-invoke-stockroot-83/83_IMAGE >$validate_tmp/hk-invoke-stockroot-bootimgs-check.out
+    rg -q 'stockroot bootimgs host-only analysis validation passed' $validate_tmp/hk-invoke-stockroot-bootimgs-check.out
+  fi
   scripts/hk-invoke/parse_ota83.py --json /tmp/hk-invoke-ota2-work-current/83_IMAGE > "$tmp_json"
   python3 - "$tmp_json" <<'PY'
 import json, sys
@@ -642,6 +697,10 @@ assert "no-nand-initramfs-ota83:" in makefile, makefile
 assert "--stage-ota83-connectivity" in makefile, makefile
 assert "make no-nand-readiness" in readme, readme
 assert "make native-connectivity-packet" in readme, readme
+assert "golden NAND preflight" in readme, readme
+assert "strict Invoke Bluetooth output" in readme, readme
+assert "Operator next step" in readme, readme
+assert "normal-mode surface restore only" in readme, readme
 assert "make no-nand-initramfs-ota83" in readme, readme
 assert "HK_INVOKE_RAM_OTA83_MODULE_LOAD_APPROVED" in readme, readme
 assert "hold_no_custom_boot" in current, current
