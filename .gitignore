@@ -1,0 +1,36 @@
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Python/runtime artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Firmware/recovery payloads: keep under ~/.local/state/hk-invoke, not git
+*.img
+*.bin
+*.cpio
+*.cpio.gz
+*.squashfs
+*.ubi
+*.mtd
+*.nand
+*_IMAGE
+OTA2/
+hk-invoke-ota2*.zip
+recovery-baselines/
+ota83-extracts/
+dumps/
+artifacts/
